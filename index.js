@@ -641,7 +641,7 @@ class YourDungeonBot {
 
     async start() {
         try {
-            await this.client.login(process.env.DISCORD_TOKEN);
+            await this.client.login(process.env.DISCORD_BOT_TOKEN);
         } catch (error) {
             console.error('❌ Failed to start bot:', error);
             process.exit(1);
