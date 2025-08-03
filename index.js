@@ -1,785 +1,652 @@
-const {
-  Client,
-  GatewayIntentBits,
-  PermissionFlagsBits,
-  ChannelType,
-  EmbedBuilder,
-} = require("discord.js");
-require("dotenv").config();
+const { Client, GatewayIntentBits, PermissionFlagsBits, ChannelType, EmbedBuilder, ActivityType } = require('discord.js');
+require('dotenv').config();
 
 class YourDungeonBot {
-  constructor() {
-    this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-      ],
-    });
+    constructor() {
+        this.client = new Client({
+            intents: [
+                GatewayIntentBits.Guilds,
+                GatewayIntentBits.GuildVoiceStates,
+                GatewayIntentBits.GuildMessages,
+                GatewayIntentBits.MessageContent
+            ]
+        });
 
-    // Track active dungeons: Map<channelId, dungeonData>
-    this.dungeons = new Map();
-
-    // Track deletion timers: Map<channelId, timeoutId>
-    this.deletionTimers = new Map();
-
-    // Configuration
-    this.config = {
-      prefix: ".d ",
-      triggerChannelName: "🎙️ your-dungeon",
-      inactivityTimeout: 2 * 60 * 1000, // 2 minutes in milliseconds
-      dungeonCategoryName: "DUNGEONS", // Optional: create dungeons in specific category
-    };
-
-    this.setupEventHandlers();
-  }
-
-  setupEventHandlers() {
-    this.client.once("ready", () => {
-      console.log(
-        `✅ Your Dungeon Bot is ready! Logged in as ${this.client.user.tag}`
-      );
-      this.client.user.setActivity("🎙️ Creating dungeons", {
-        type: "WATCHING",
-      });
-    });
-
-    this.client.on("voiceStateUpdate", (oldState, newState) => {
-      this.handleVoiceStateUpdate(oldState, newState);
-    });
-
-    this.client.on("messageCreate", (message) => {
-      this.handleMessage(message);
-    });
-
-    this.client.on("error", console.error);
-  }
-
-  async handleVoiceStateUpdate(oldState, newState) {
-    // User joined the trigger channel - create dungeon
-    if (
-      newState.channel &&
-      newState.channel.name === this.config.triggerChannelName
-    ) {
-      await this.createDungeon(newState.member, newState.guild);
+        // In-memory storage
+        this.activeDungeons = new Map(); // channelId -> { ownerId, createdAt, isLocked, invitedUsers, userLimit, guildId }
+        this.deletionTimers = new Map(); // channelId -> timeoutId
+        
+        // Configuration
+        this.TRIGGER_CHANNEL_NAME = '🎙️ your-dungeon';
+        this.DUNGEONS_CATEGORY_NAME = 'DUNGEONS';
+        this.COMMAND_PREFIX = '.d ';
+        this.DELETION_TIMEOUT = 2 * 60 * 1000; // 2 minutes
+        
+        this.setupEventHandlers();
+        this.setupGracefulShutdown();
     }
 
-    // Check if user left a dungeon
-    if (oldState.channel && this.dungeons.has(oldState.channel.id)) {
-      await this.checkDungeonEmpty(oldState.channel);
+    setupEventHandlers() {
+        this.client.once('ready', () => {
+            console.log(`✅ ${this.client.user.tag} is online and ready!`);
+            this.client.user.setActivity('Managing Dungeons', { type: ActivityType.Watching });
+            this.cleanupOrphanedChannels();
+        });
+
+        this.client.on('voiceStateUpdate', (oldState, newState) => {
+            this.handleVoiceStateUpdate(oldState, newState);
+        });
+
+        this.client.on('messageCreate', (message) => {
+            this.handleMessage(message);
+        });
+
+        this.client.on('error', (error) => {
+            console.error('❌ Discord client error:', error);
+        });
     }
 
-    // Check if user joined a dungeon (cancel deletion timer)
-    if (newState.channel && this.dungeons.has(newState.channel.id)) {
-      this.cancelDeletionTimer(newState.channel.id);
+    async handleVoiceStateUpdate(oldState, newState) {
+        try {
+            // Handle joining trigger channel
+            if (newState.channel && newState.channel.name === this.TRIGGER_CHANNEL_NAME) {
+                await this.createDungeon(newState.member, newState.guild);
+            }
+
+            // Handle leaving dungeons
+            if (oldState.channel && this.activeDungeons.has(oldState.channel.id)) {
+                await this.handleDungeonLeave(oldState.channel);
+            }
+
+            // Handle joining dungeons (cancel deletion if someone joins)
+            if (newState.channel && this.activeDungeons.has(newState.channel.id)) {
+                await this.handleDungeonJoin(newState.channel);
+            }
+        } catch (error) {
+            console.error('❌ Error handling voice state update:', error);
+        }
     }
-  }
 
-  async createDungeon(member, guild) {
-    try {
-      // Check bot permissions first
-      const botMember = guild.members.cache.get(this.client.user.id);
-      const requiredPermissions = [
-        PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.Connect,
-        PermissionFlagsBits.MoveMembers,
-      ];
+    async createDungeon(member, guild) {
+        try {
+            // Check permissions
+            if (!guild.members.me.permissions.has([
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.MoveMembers,
+                PermissionFlagsBits.Connect
+            ])) {
+                console.error('❌ Missing required permissions to create dungeons');
+                return;
+            }
 
-      const missingPermissions = requiredPermissions.filter(
-        (perm) => !botMember.permissions.has(perm)
-      );
+            // Find or create DUNGEONS category
+            let category = guild.channels.cache.find(
+                c => c.type === ChannelType.GuildCategory && c.name === this.DUNGEONS_CATEGORY_NAME
+            );
 
-      if (missingPermissions.length > 0) {
-        console.error(
-          `❌ Bot missing permissions: ${missingPermissions
-            .map((p) =>
-              Object.keys(PermissionFlagsBits).find(
-                (key) => PermissionFlagsBits[key] === p
-              )
-            )
-            .join(", ")}`
-        );
+            if (!category) {
+                category = await guild.channels.create({
+                    name: this.DUNGEONS_CATEGORY_NAME,
+                    type: ChannelType.GuildCategory,
+                    permissionOverwrites: [
+                        {
+                            id: guild.roles.everyone,
+                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect],
+                            deny: [PermissionFlagsBits.ManageChannels]
+                        }
+                    ]
+                });
+                console.log(`📁 Created DUNGEONS category`);
+            }
 
-        // Try to send error message to a general channel
-        const generalChannel = guild.channels.cache.find(
-          (c) =>
-            c.type === ChannelType.GuildText &&
-            (c.name.includes("general") ||
-              c.name.includes("bot") ||
-              c.name.includes("command"))
-        );
+            // Create the dungeon voice channel
+            const dungeonName = `${member.displayName}'s Dungeon`;
+            const dungeonChannel = await guild.channels.create({
+                name: dungeonName,
+                type: ChannelType.GuildVoice,
+                parent: category.id,
+                permissionOverwrites: [
+                    {
+                        id: guild.roles.everyone,
+                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak],
+                        deny: [PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers]
+                    },
+                    {
+                        id: member.id,
+                        allow: [
+                            PermissionFlagsBits.ViewChannel,
+                            PermissionFlagsBits.Connect,
+                            PermissionFlagsBits.Speak,
+                            PermissionFlagsBits.ManageChannels,
+                            PermissionFlagsBits.MoveMembers,
+                            PermissionFlagsBits.MuteMembers,
+                            PermissionFlagsBits.DeafenMembers
+                        ]
+                    }
+                ]
+            });
 
-        if (
-          generalChannel &&
-          generalChannel
-            .permissionsFor(botMember)
-            .has(PermissionFlagsBits.SendMessages)
-        ) {
-          const errorEmbed = new EmbedBuilder()
-            .setColor("#ff0000")
-            .setTitle("❌ Bot Missing Permissions")
-            .setDescription(
-              `I need the following permissions to create dungeons:\n• Manage Channels\n• Connect\n• Move Members\n\nPlease ask an administrator to grant these permissions.`
+            // Store dungeon data
+            this.activeDungeons.set(dungeonChannel.id, {
+                ownerId: member.id,
+                createdAt: Date.now(),
+                isLocked: false,
+                invitedUsers: new Set(),
+                userLimit: null,
+                guildId: guild.id
+            });
+
+            // Move user to their dungeon
+            await this.retryOperation(() => member.voice.setChannel(dungeonChannel));
+
+            console.log(`🏰 Created dungeon "${dungeonName}" for ${member.displayName}`);
+
+            // Send welcome message
+            await this.sendWelcomeMessage(dungeonChannel, member);
+
+        } catch (error) {
+            console.error('❌ Error creating dungeon:', error);
+        }
+    }
+
+    async handleDungeonLeave(channel) {
+        const realUsers = channel.members.filter(member => !member.user.bot);
+        
+        if (realUsers.size === 0) {
+            // Start deletion timer
+            this.startDeletionTimer(channel.id);
+        }
+    }
+
+    async handleDungeonJoin(channel) {
+        const realUsers = channel.members.filter(member => !member.user.bot);
+        
+        if (realUsers.size > 0) {
+            // Cancel deletion timer if users are present
+            this.cancelDeletionTimer(channel.id);
+        }
+    }
+
+    startDeletionTimer(channelId) {
+        // Cancel existing timer if any
+        this.cancelDeletionTimer(channelId);
+
+        const timeoutId = setTimeout(async () => {
+            await this.deleteDungeon(channelId, 'Auto-deletion (empty for 2 minutes)');
+        }, this.DELETION_TIMEOUT);
+
+        this.deletionTimers.set(channelId, timeoutId);
+        console.log(`⏱️ Started deletion timer for dungeon ${channelId}`);
+    }
+
+    cancelDeletionTimer(channelId) {
+        const timeoutId = this.deletionTimers.get(channelId);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            this.deletionTimers.delete(channelId);
+            console.log(`⏹️ Cancelled deletion timer for dungeon ${channelId}`);
+        }
+    }
+
+    async deleteDungeon(channelId, reason = 'Manual deletion') {
+        try {
+            const dungeonData = this.activeDungeons.get(channelId);
+            if (!dungeonData) return;
+
+            const channel = this.client.channels.cache.get(channelId);
+            if (channel) {
+                await this.retryOperation(() => channel.delete());
+                console.log(`🗑️ Deleted dungeon ${channel.name} - ${reason}`);
+            }
+
+            // Clean up data
+            this.activeDungeons.delete(channelId);
+            this.cancelDeletionTimer(channelId);
+        } catch (error) {
+            console.error('❌ Error deleting dungeon:', error);
+        }
+    }
+
+    async handleMessage(message) {
+        if (message.author.bot || !message.content.startsWith(this.COMMAND_PREFIX)) return;
+
+        const channel = message.channel;
+        const voiceChannel = message.member?.voice?.channel;
+
+        // Check if user is in a dungeon
+        if (!voiceChannel || !this.activeDungeons.has(voiceChannel.id)) {
+            return;
+        }
+
+        const dungeonData = this.activeDungeons.get(voiceChannel.id);
+        const args = message.content.slice(this.COMMAND_PREFIX.length).trim().split(' ');
+        const command = args[0].toLowerCase();
+
+        try {
+            switch (command) {
+                case 'help':
+                    await this.sendHelpEmbed(message);
+                    break;
+                case 'info':
+                    await this.sendInfoEmbed(message, voiceChannel, dungeonData);
+                    break;
+                case 'lock':
+                    await this.lockDungeon(message, voiceChannel, dungeonData);
+                    break;
+                case 'unlock':
+                    await this.unlockDungeon(message, voiceChannel, dungeonData);
+                    break;
+                case 'invite':
+                    await this.inviteUser(message, voiceChannel, dungeonData, args);
+                    break;
+                case 'kick':
+                    await this.kickUser(message, voiceChannel, dungeonData, args);
+                    break;
+                case 'limit':
+                    await this.setUserLimit(message, voiceChannel, dungeonData, args);
+                    break;
+                case 'rename':
+                    await this.renameDungeon(message, voiceChannel, dungeonData, args);
+                    break;
+                case 'end':
+                    await this.endDungeon(message, voiceChannel, dungeonData);
+                    break;
+                case 'claim':
+                    await this.claimDungeon(message, voiceChannel, dungeonData);
+                    break;
+                case 'extend':
+                    await this.extendDungeon(message, voiceChannel);
+                    break;
+                default:
+                    await this.sendErrorEmbed(message, 'Unknown command. Use `.d help` for available commands.');
+            }
+        } catch (error) {
+            console.error(`❌ Error executing command ${command}:`, error);
+            await this.sendErrorEmbed(message, 'An error occurred while executing the command.');
+        }
+    }
+
+    async sendHelpEmbed(message) {
+        const embed = new EmbedBuilder()
+            .setTitle('🏰 Dungeon Commands')
+            .setColor(0x7289DA)
+            .setDescription('Available commands for managing your dungeon:')
+            .addFields(
+                { name: '📋 `.d info`', value: 'Show dungeon information', inline: true },
+                { name: '🔒 `.d lock`', value: 'Lock the dungeon', inline: true },
+                { name: '🔓 `.d unlock`', value: 'Unlock the dungeon', inline: true },
+                { name: '📨 `.d invite @user`', value: 'Invite a user to locked dungeon', inline: true },
+                { name: '👢 `.d kick @user`', value: 'Kick a user from dungeon', inline: true },
+                { name: '👥 `.d limit [number]`', value: 'Set user limit', inline: true },
+                { name: '✏️ `.d rename [name]`', value: 'Rename the dungeon', inline: true },
+                { name: '🗑️ `.d end`', value: 'Delete the dungeon', inline: true },
+                { name: '👑 `.d claim`', value: 'Claim an empty dungeon', inline: true },
+                { name: '⏰ `.d extend`', value: 'Extend auto-deletion timer', inline: true }
             )
             .setTimestamp();
 
-          await generalChannel.send({ embeds: [errorEmbed] });
+        await message.reply({ embeds: [embed] });
+    }
+
+    async sendInfoEmbed(message, voiceChannel, dungeonData) {
+        const owner = await this.client.users.fetch(dungeonData.ownerId);
+        const users = voiceChannel.members.filter(m => !m.user.bot).map(m => m.displayName).join(', ') || 'None';
+        const status = dungeonData.isLocked ? '🔒 Locked' : '🔓 Unlocked';
+        const limit = dungeonData.userLimit ? `${dungeonData.userLimit} users` : 'No limit';
+        
+        let deletionInfo = '';
+        if (this.deletionTimers.has(voiceChannel.id)) {
+            deletionInfo = `⏱️ **Auto-deletion:** ${this.formatTime(120)} remaining`;
         }
-        return;
-      }
 
-      // Find or create dungeons category
-      let category = guild.channels.cache.find(
-        (c) =>
-          c.type === ChannelType.GuildCategory &&
-          c.name === this.config.dungeonCategoryName
-      );
+        const embed = new EmbedBuilder()
+            .setTitle(`🏰 ${voiceChannel.name}`)
+            .setColor(0x00FF00)
+            .addFields(
+                { name: '👑 Owner', value: owner.displayName, inline: true },
+                { name: '🔒 Status', value: status, inline: true },
+                { name: '👥 User Limit', value: limit, inline: true },
+                { name: '📋 Users Inside', value: users, inline: false }
+            )
+            .setTimestamp();
 
-      if (!category) {
+        if (deletionInfo) {
+            embed.addFields({ name: 'Auto-Deletion', value: deletionInfo, inline: false });
+        }
+
+        await message.reply({ embeds: [embed] });
+    }
+
+    async lockDungeon(message, voiceChannel, dungeonData) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can lock it.');
+            return;
+        }
+
+        await voiceChannel.permissionOverwrites.edit(message.guild.roles.everyone, {
+            Connect: false
+        });
+
+        dungeonData.isLocked = true;
+        await this.sendSuccessEmbed(message, '🔒 Dungeon locked! Only invited users can join.');
+    }
+
+    async unlockDungeon(message, voiceChannel, dungeonData) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can unlock it.');
+            return;
+        }
+
+        await voiceChannel.permissionOverwrites.edit(message.guild.roles.everyone, {
+            Connect: true
+        });
+
+        dungeonData.isLocked = false;
+        dungeonData.invitedUsers.clear();
+        await this.sendSuccessEmbed(message, '🔓 Dungeon unlocked! Anyone can join now.');
+    }
+
+    async inviteUser(message, voiceChannel, dungeonData, args) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can invite users.');
+            return;
+        }
+
+        const user = message.mentions.users.first();
+        if (!user) {
+            await this.sendErrorEmbed(message, 'Please mention a user to invite.');
+            return;
+        }
+
+        await voiceChannel.permissionOverwrites.edit(user.id, {
+            Connect: true
+        });
+
+        dungeonData.invitedUsers.add(user.id);
+        await this.sendSuccessEmbed(message, `📨 Invited ${user.displayName} to the dungeon!`);
+    }
+
+    async kickUser(message, voiceChannel, dungeonData, args) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can kick users.');
+            return;
+        }
+
+        const user = message.mentions.users.first();
+        if (!user) {
+            await this.sendErrorEmbed(message, 'Please mention a user to kick.');
+            return;
+        }
+
+        const member = message.guild.members.cache.get(user.id);
+        if (member && member.voice.channel === voiceChannel) {
+            await this.retryOperation(() => member.voice.disconnect());
+            await this.sendSuccessEmbed(message, `👢 Kicked ${user.displayName} from the dungeon!`);
+        } else {
+            await this.sendErrorEmbed(message, 'User is not in this dungeon.');
+        }
+    }
+
+    async setUserLimit(message, voiceChannel, dungeonData, args) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can set the user limit.');
+            return;
+        }
+
+        const limit = parseInt(args[1]);
+        if (isNaN(limit) || limit < 0 || limit > 99) {
+            await this.sendErrorEmbed(message, 'Please provide a valid number between 0-99 (0 = no limit).');
+            return;
+        }
+
+        const userLimit = limit === 0 ? null : limit;
+        await voiceChannel.setUserLimit(userLimit);
+        
+        dungeonData.userLimit = userLimit;
+        const limitText = userLimit ? `${userLimit} users` : 'No limit';
+        await this.sendSuccessEmbed(message, `👥 User limit set to: ${limitText}`);
+    }
+
+    async renameDungeon(message, voiceChannel, dungeonData, args) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can rename it.');
+            return;
+        }
+
+        const newName = args.slice(1).join(' ');
+        if (!newName || newName.length > 100) {
+            await this.sendErrorEmbed(message, 'Please provide a valid name (1-100 characters).');
+            return;
+        }
+
+        await voiceChannel.setName(newName);
+        await this.sendSuccessEmbed(message, `✏️ Dungeon renamed to: "${newName}"`);
+    }
+
+    async endDungeon(message, voiceChannel, dungeonData) {
+        if (message.author.id !== dungeonData.ownerId) {
+            await this.sendErrorEmbed(message, 'Only the dungeon owner can end the dungeon.');
+            return;
+        }
+
+        await this.sendSuccessEmbed(message, '🗑️ Dungeon will be deleted in 3 seconds...');
+        setTimeout(() => {
+            this.deleteDungeon(voiceChannel.id, 'Manual deletion by owner');
+        }, 3000);
+    }
+
+    async claimDungeon(message, voiceChannel, dungeonData) {
+        const realUsers = voiceChannel.members.filter(m => !m.user.bot);
+        
+        if (realUsers.size > 1) {
+            await this.sendErrorEmbed(message, 'Cannot claim a dungeon with multiple users.');
+            return;
+        }
+
+        if (dungeonData.ownerId === message.author.id) {
+            await this.sendErrorEmbed(message, 'You already own this dungeon.');
+            return;
+        }
+
+        // Transfer ownership
+        dungeonData.ownerId = message.author.id;
+        dungeonData.isLocked = false;
+        dungeonData.invitedUsers.clear();
+
+        // Update permissions
+        const oldOwner = await this.client.users.fetch(dungeonData.ownerId);
+        await voiceChannel.permissionOverwrites.edit(oldOwner.id, {
+            ManageChannels: false,
+            MoveMembers: false,
+            MuteMembers: false,
+            DeafenMembers: false
+        });
+
+        await voiceChannel.permissionOverwrites.edit(message.author.id, {
+            ViewChannel: true,
+            Connect: true,
+            Speak: true,
+            ManageChannels: true,
+            MoveMembers: true,
+            MuteMembers: true,
+            DeafenMembers: true
+        });
+
+        this.cancelDeletionTimer(voiceChannel.id);
+        await this.sendSuccessEmbed(message, '👑 You are now the owner of this dungeon!');
+    }
+
+    async extendDungeon(message, voiceChannel) {
+        if (this.deletionTimers.has(voiceChannel.id)) {
+            this.cancelDeletionTimer(voiceChannel.id);
+            this.startDeletionTimer(voiceChannel.id);
+            await this.sendSuccessEmbed(message, '⏰ Auto-deletion timer extended by 2 minutes!');
+        } else {
+            await this.sendErrorEmbed(message, 'No active deletion timer to extend.');
+        }
+    }
+
+    async sendWelcomeMessage(dungeonChannel, member) {
         try {
-          category = await guild.channels.create({
-            name: this.config.dungeonCategoryName,
-            type: ChannelType.GuildCategory,
-            position: 0,
-          });
-          console.log(
-            `✅ Created category: ${this.config.dungeonCategoryName}`
-          );
-        } catch (categoryError) {
-          console.log(`⚠️ Could not create category, using no parent instead`);
-          category = null;
+            // Try to find a text channel to send welcome message
+            const guild = dungeonChannel.guild;
+            let textChannel = null;
+
+            // Look for general channels
+            const generalChannels = guild.channels.cache.filter(c => 
+                c.type === ChannelType.GuildText && 
+                (c.name.includes('general') || c.name.includes('chat'))
+            );
+
+            if (generalChannels.size > 0) {
+                textChannel = generalChannels.first();
+            } else {
+                // Fallback to first available text channel
+                textChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText);
+            }
+
+            if (textChannel) {
+                const embed = new EmbedBuilder()
+                    .setTitle('🏰 New Dungeon Created!')
+                    .setDescription(`${member.displayName} created a private dungeon!`)
+                    .addFields(
+                        { name: '📍 Channel', value: `<#${dungeonChannel.id}>`, inline: true },
+                        { name: '💬 Commands', value: 'Use `.d help` in voice chat for commands', inline: true }
+                    )
+                    .setColor(0x00FF00)
+                    .setTimestamp();
+
+                await textChannel.send({ embeds: [embed] });
+            }
+        } catch (error) {
+            console.error('❌ Error sending welcome message:', error);
         }
-      }
+    }
 
-      // Create voice channel
-      const channelData = {
-        name: `${member.displayName}'s Dungeon`,
-        type: ChannelType.GuildVoice,
-        permissionOverwrites: [
-          {
-            id: guild.roles.everyone.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.Connect,
-            ],
-          },
-          {
-            id: member.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.Connect,
-              PermissionFlagsBits.ManageChannels,
-              PermissionFlagsBits.MoveMembers,
-            ],
-          },
-        ],
-      };
+    async sendSuccessEmbed(message, text) {
+        const embed = new EmbedBuilder()
+            .setDescription(`✅ ${text}`)
+            .setColor(0x00FF00);
+        await message.reply({ embeds: [embed] });
+    }
 
-      // Only add parent if category exists
-      if (category) {
-        channelData.parent = category.id;
-      }
+    async sendErrorEmbed(message, text) {
+        const embed = new EmbedBuilder()
+            .setDescription(`❌ ${text}`)
+            .setColor(0xFF0000);
+        await message.reply({ embeds: [embed] });
+    }
 
-      const voiceChannel = await guild.channels.create(channelData);
+    formatTime(seconds) {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
 
-      // Move user to their new dungeon
-      if (member.voice.channel) {
-        await member.voice.setChannel(voiceChannel);
-      }
+    async retryOperation(operation, maxRetries = 3) {
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                return await operation();
+            } catch (error) {
+                if (i === maxRetries - 1) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+            }
+        }
+    }
 
-      // Store dungeon data
-      this.dungeons.set(voiceChannel.id, {
-        ownerId: member.id,
-        ownerName: member.displayName,
-        createdAt: Date.now(),
-        isLocked: false,
-        userLimit: null,
-        invitedUsers: new Set(),
-      });
+    async cleanupOrphanedChannels() {
+        console.log('🧹 Cleaning up orphaned dungeon channels...');
+        
+        for (const guild of this.client.guilds.cache.values()) {
+            try {
+                const category = guild.channels.cache.find(
+                    c => c.type === ChannelType.GuildCategory && c.name === this.DUNGEONS_CATEGORY_NAME
+                );
 
-      // Send welcome message to a suitable text channel
-      const embed = new EmbedBuilder()
-        .setColor("#00ff00")
-        .setTitle("🏰 Dungeon Created Successfully!")
-        .setDescription(
-          `**${member.displayName}** has created a dungeon: **${voiceChannel.name}**\n\nJoin the voice channel and use \`${this.config.prefix}help\` in any text channel to see available commands.`
-        )
-        .setFooter({
-          text: "Dungeon will auto-delete after 2 minutes of inactivity",
-        })
-        .setTimestamp();
+                if (!category) continue;
 
-      // Try to find a suitable text channel to send the welcome message
-      const textChannels = guild.channels.cache.filter(
-        (c) =>
-          c.type === ChannelType.GuildText &&
-          c
-            .permissionsFor(botMember)
-            .has([
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.EmbedLinks,
-            ])
-      );
+                const dungeonChannels = category.children.cache.filter(c => c.type === ChannelType.GuildVoice);
+                
+                for (const [channelId, channel] of dungeonChannels) {
+                    const realUsers = channel.members.filter(m => !m.user.bot);
+                    
+                    if (realUsers.size === 0) {
+                        await this.retryOperation(() => channel.delete());
+                        console.log(`🗑️ Cleaned up orphaned channel: ${channel.name}`);
+                    } else {
+                        // Restore to active dungeons if it has users
+                        if (!this.activeDungeons.has(channelId)) {
+                            const firstUser = realUsers.first();
+                            this.activeDungeons.set(channelId, {
+                                ownerId: firstUser.id,
+                                createdAt: Date.now(),
+                                isLocked: false,
+                                invitedUsers: new Set(),
+                                userLimit: channel.userLimit || null,
+                                guildId: guild.id
+                            });
+                            console.log(`🔄 Restored dungeon to active list: ${channel.name}`);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error(`❌ Error cleaning up guild ${guild.name}:`, error);
+            }
+        }
+    }
 
-      const suitableChannel =
-        textChannels.find(
-          (c) =>
-            c.name.includes("general") ||
-            c.name.includes("bot") ||
-            c.name.includes("command")
-        ) || textChannels.first();
+    setupGracefulShutdown() {
+        const cleanup = async () => {
+            console.log('\n🛑 Shutting down bot...');
+            
+            // Cancel all deletion timers
+            for (const timeoutId of this.deletionTimers.values()) {
+                clearTimeout(timeoutId);
+            }
 
-      if (suitableChannel) {
-        await suitableChannel.send({ embeds: [embed] });
-      }
+            // Clean up empty dungeons
+            const deletionPromises = [];
+            for (const [channelId, dungeonData] of this.activeDungeons) {
+                try {
+                    const channel = this.client.channels.cache.get(channelId);
+                    if (channel) {
+                        const realUsers = channel.members.filter(m => !m.user.bot);
+                        if (realUsers.size === 0) {
+                            deletionPromises.push(
+                                this.retryOperation(() => channel.delete())
+                                    .then(() => console.log(`🗑️ Cleaned up empty dungeon: ${channel.name}`))
+                                    .catch(err => console.error(`❌ Error cleaning up ${channel.name}:`, err))
+                            );
+                        }
+                    }
+                } catch (error) {
+                    console.error(`❌ Error during cleanup of channel ${channelId}:`, error);
+                }
+            }
 
-      console.log(
-        `✅ Created dungeon: ${voiceChannel.name} for ${member.displayName}`
-      );
-    } catch (error) {
-      console.error("❌ Error creating dungeon:", error.message);
+            await Promise.allSettled(deletionPromises);
+            
+            this.client.destroy();
+            console.log('✅ Bot shutdown complete');
+            process.exit(0);
+        };
 
-      // Send user-friendly error message
-      const errorChannel = guild.channels.cache.find(
-        (c) =>
-          c.type === ChannelType.GuildText &&
-          c
-            .permissionsFor(guild.members.cache.get(this.client.user.id))
-            ?.has(PermissionFlagsBits.SendMessages)
-      );
+        process.on('SIGINT', cleanup);
+        process.on('SIGTERM', cleanup);
+        process.on('uncaughtException', (error) => {
+            console.error('❌ Uncaught Exception:', error);
+            cleanup();
+        });
+    }
 
-      if (errorChannel) {
-        const errorEmbed = new EmbedBuilder()
-          .setColor("#ff0000")
-          .setTitle("❌ Failed to Create Dungeon")
-          .setDescription(
-            `Sorry ${member.displayName}, I couldn't create your dungeon. Please contact an administrator to check my permissions.`
-          )
-          .setTimestamp();
-
+    async start() {
         try {
-          await errorChannel.send({ embeds: [errorEmbed] });
-        } catch (msgError) {
-          console.error("Could not send error message:", msgError.message);
+            await this.client.login(process.env.DISCORD_TOKEN);
+        } catch (error) {
+            console.error('❌ Failed to start bot:', error);
+            process.exit(1);
         }
-      }
     }
-  }
-
-  async checkDungeonEmpty(voiceChannel) {
-    if (voiceChannel.members.size === 0) {
-      // Start deletion timer
-      const timerId = setTimeout(() => {
-        this.deleteDungeon(voiceChannel.id);
-      }, this.config.inactivityTimeout);
-
-      this.deletionTimers.set(voiceChannel.id, timerId);
-      console.log(
-        `⏱️ Started deletion timer for empty dungeon: ${voiceChannel.name}`
-      );
-    }
-  }
-
-  cancelDeletionTimer(channelId) {
-    if (this.deletionTimers.has(channelId)) {
-      clearTimeout(this.deletionTimers.get(channelId));
-      this.deletionTimers.delete(channelId);
-      console.log(`⏹️ Cancelled deletion timer for dungeon: ${channelId}`);
-    }
-  }
-
-  async deleteDungeon(channelId) {
-    try {
-      const channel = this.client.channels.cache.get(channelId);
-      if (channel) {
-        const dungeonData = this.dungeons.get(channelId);
-        console.log(`🗑️ Auto-deleting empty dungeon: ${channel.name}`);
-
-        await channel.delete("Dungeon auto-deleted due to inactivity");
-
-        this.dungeons.delete(channelId);
-        this.deletionTimers.delete(channelId);
-      }
-    } catch (error) {
-      console.error("Error deleting dungeon:", error);
-    }
-  }
-
-  async handleMessage(message) {
-    // Ignore bot messages
-    if (message.author.bot) return;
-
-    // Check if message starts with prefix
-    if (!message.content.startsWith(this.config.prefix)) return;
-
-    console.log(
-      `📝 Command received: ${message.content} from ${message.author.displayName}`
-    );
-
-    // Get the member who sent the message
-    const member = message.guild.members.cache.get(message.author.id);
-
-    // Check if user is in a voice channel
-    if (!member.voice.channel) {
-      console.log(`❌ User ${message.author.displayName} not in voice channel`);
-      return this.sendErrorMessage(
-        message.channel,
-        "You must be in a dungeon voice channel to use dungeon commands."
-      );
-    }
-
-    const voiceChannel = member.voice.channel;
-    console.log(
-      `🎙️ User in voice channel: ${voiceChannel.name} (ID: ${voiceChannel.id})`
-    );
-
-    // Check if the voice channel is a dungeon
-    if (!this.dungeons.has(voiceChannel.id)) {
-      console.log(
-        `❌ Voice channel ${voiceChannel.name} is not a tracked dungeon`
-      );
-      console.log(`🗂️ Current dungeons:`, Array.from(this.dungeons.keys()));
-      return this.sendErrorMessage(
-        message.channel,
-        `The voice channel "${voiceChannel.name}" is not a dungeon. Commands only work in dungeon voice channels.`
-      );
-    }
-
-    console.log(
-      `✅ Valid dungeon command from ${message.author.displayName} in ${voiceChannel.name}`
-    );
-
-    const args = message.content
-      .slice(this.config.prefix.length)
-      .trim()
-      .split(/ +/);
-    const command = args.shift().toLowerCase();
-
-    console.log(`🎯 Executing command: ${command} with args:`, args);
-
-    await this.executeCommand(message, command, args, voiceChannel);
-  }
-
-  async executeCommand(message, command, args, voiceChannel) {
-    const dungeonData = this.dungeons.get(voiceChannel.id);
-    const isOwner = message.author.id === dungeonData.ownerId;
-    const member = message.guild.members.cache.get(message.author.id);
-
-    console.log(
-      `🎮 Executing command "${command}" - Owner: ${isOwner} - User: ${message.author.displayName}`
-    );
-
-    try {
-      switch (command) {
-        case "help":
-          console.log("📋 Sending help message");
-          await this.sendHelpMessage(message.channel);
-          break;
-
-        case "owner":
-          console.log("👑 Showing owner info");
-          await this.showOwner(message.channel, dungeonData);
-          break;
-
-        case "claim":
-          console.log("🏰 Processing claim command");
-          await this.claimDungeon(message, voiceChannel, dungeonData, member);
-          break;
-
-        case "lock":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to lock");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can lock the dungeon."
-            );
-          }
-          console.log("🔒 Locking dungeon");
-          await this.lockDungeon(message.channel, voiceChannel, dungeonData);
-          break;
-
-        case "unlock":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to unlock");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can unlock the dungeon."
-            );
-          }
-          console.log("🔓 Unlocking dungeon");
-          await this.unlockDungeon(message.channel, voiceChannel, dungeonData);
-          break;
-
-        case "invite":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to invite");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can invite users."
-            );
-          }
-          console.log("📨 Processing invite");
-          await this.inviteUser(message, args, voiceChannel, dungeonData);
-          break;
-
-        case "kick":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to kick");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can kick users."
-            );
-          }
-          console.log("👢 Processing kick");
-          await this.kickUser(message, args, voiceChannel);
-          break;
-
-        case "limit":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to set limit");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can set user limits."
-            );
-          }
-          console.log("👥 Setting user limit");
-          await this.setUserLimit(
-            message.channel,
-            args,
-            voiceChannel,
-            dungeonData
-          );
-          break;
-
-        case "rename":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to rename");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can rename the dungeon."
-            );
-          }
-          console.log("✏️ Renaming dungeon");
-          await this.renameDungeon(
-            message.channel,
-            args,
-            voiceChannel,
-            dungeonData
-          );
-          break;
-
-        case "end":
-          if (!isOwner) {
-            console.log("❌ Non-owner tried to end");
-            return this.sendErrorMessage(
-              message.channel,
-              "Only the dungeon owner can end the dungeon."
-            );
-          }
-          console.log("🏁 Ending dungeon");
-          await this.endDungeon(message.channel, voiceChannel);
-          break;
-
-        default:
-          console.log(`❓ Unknown command: ${command}`);
-          await this.sendErrorMessage(
-            message.channel,
-            `Unknown command: \`${command}\`. Use \`${this.config.prefix}help\` for available commands.`
-          );
-      }
-    } catch (error) {
-      console.error("❌ Error executing command:", error);
-      await this.sendErrorMessage(
-        message.channel,
-        "An error occurred while executing the command."
-      );
-    }
-  }
-
-  async sendHelpMessage(channel) {
-    const embed = new EmbedBuilder()
-      .setColor("#0099ff")
-      .setTitle("🏰 Dungeon Commands Help")
-      .setDescription(`**Prefix:** \`${this.config.prefix}\``)
-      .addFields(
-        {
-          name: "📋 General Commands",
-          value:
-            "`help` - Show this help message\n`owner` - Display current dungeon owner\n`claim` - Claim an empty dungeon",
-          inline: false,
-        },
-        {
-          name: "👑 Owner Only Commands",
-          value:
-            "`lock` - Lock dungeon from public access\n`unlock` - Unlock dungeon for anyone to join\n`invite @user` - Allow a user to join locked dungeon\n`kick @user` - Disconnect a user from dungeon\n`limit X` - Set max number of users (1-99)\n`rename New Name` - Rename the dungeon\n`end` - Delete your dungeon manually",
-          inline: false,
-        }
-      )
-      .setFooter({
-        text: "Commands only work in this dungeon's voice channel chat",
-      })
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async showOwner(channel, dungeonData) {
-    const embed = new EmbedBuilder()
-      .setColor("#gold")
-      .setTitle("👑 Dungeon Owner")
-      .setDescription(`**${dungeonData.ownerName}** owns this dungeon`)
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async claimDungeon(message, voiceChannel, dungeonData, member) {
-    if (voiceChannel.members.size > 0) {
-      return this.sendErrorMessage(
-        message.channel,
-        "Cannot claim a dungeon that has users in it."
-      );
-    }
-
-    // Update dungeon ownership
-    dungeonData.ownerId = member.id;
-    dungeonData.ownerName = member.displayName;
-    dungeonData.isLocked = false;
-    dungeonData.invitedUsers.clear();
-
-    // Update channel permissions
-    await voiceChannel.permissionOverwrites.edit(member.id, {
-      ViewChannel: true,
-      Connect: true,
-      ManageChannels: true,
-      MoveMembers: true,
-    });
-
-    // Rename channel
-    await voiceChannel.setName(`${member.displayName}'s Dungeon`);
-
-    const embed = new EmbedBuilder()
-      .setColor("#00ff00")
-      .setTitle("👑 Dungeon Claimed!")
-      .setDescription(`**${member.displayName}** has claimed this dungeon!`)
-      .setTimestamp();
-
-    await message.channel.send({ embeds: [embed] });
-  }
-
-  async lockDungeon(channel, voiceChannel, dungeonData) {
-    dungeonData.isLocked = true;
-
-    await voiceChannel.permissionOverwrites.edit(
-      voiceChannel.guild.roles.everyone.id,
-      {
-        Connect: false,
-      }
-    );
-
-    const embed = new EmbedBuilder()
-      .setColor("#red")
-      .setTitle("🔒 Dungeon Locked")
-      .setDescription(
-        "This dungeon is now locked. Only invited users can join."
-      )
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async unlockDungeon(channel, voiceChannel, dungeonData) {
-    dungeonData.isLocked = false;
-
-    await voiceChannel.permissionOverwrites.edit(
-      voiceChannel.guild.roles.everyone.id,
-      {
-        Connect: true,
-      }
-    );
-
-    const embed = new EmbedBuilder()
-      .setColor("#00ff00")
-      .setTitle("🔓 Dungeon Unlocked")
-      .setDescription("This dungeon is now unlocked. Anyone can join.")
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async inviteUser(message, args, voiceChannel, dungeonData) {
-    const userMention = args[0];
-    if (!userMention) {
-      return this.sendErrorMessage(
-        message.channel,
-        "Please mention a user to invite. Example: `.d invite @username`"
-      );
-    }
-
-    const userId = userMention.replace(/[<@!>]/g, "");
-    const user = message.guild.members.cache.get(userId);
-
-    if (!user) {
-      return this.sendErrorMessage(message.channel, "User not found.");
-    }
-
-    dungeonData.invitedUsers.add(userId);
-
-    await voiceChannel.permissionOverwrites.edit(userId, {
-      Connect: true,
-    });
-
-    const embed = new EmbedBuilder()
-      .setColor("#00ff00")
-      .setTitle("📨 User Invited")
-      .setDescription(
-        `**${user.displayName}** has been invited to the dungeon!`
-      )
-      .setTimestamp();
-
-    await message.channel.send({ embeds: [embed] });
-  }
-
-  async kickUser(message, args, voiceChannel) {
-    const userMention = args[0];
-    if (!userMention) {
-      return this.sendErrorMessage(
-        message.channel,
-        "Please mention a user to kick. Example: `.d kick @username`"
-      );
-    }
-
-    const userId = userMention.replace(/[<@!>]/g, "");
-    const member = voiceChannel.members.get(userId);
-
-    if (!member) {
-      return this.sendErrorMessage(
-        message.channel,
-        "User not found in this voice channel."
-      );
-    }
-
-    await member.voice.disconnect();
-
-    const embed = new EmbedBuilder()
-      .setColor("#ff9900")
-      .setTitle("👢 User Kicked")
-      .setDescription(
-        `**${member.displayName}** has been kicked from the dungeon.`
-      )
-      .setTimestamp();
-
-    await message.channel.send({ embeds: [embed] });
-  }
-
-  async setUserLimit(channel, args, voiceChannel, dungeonData) {
-    const limit = parseInt(args[0]);
-
-    if (isNaN(limit) || limit < 0 || limit > 99) {
-      return this.sendErrorMessage(
-        channel,
-        "Please provide a valid number between 0-99. Use 0 for no limit."
-      );
-    }
-
-    await voiceChannel.setUserLimit(limit);
-    dungeonData.userLimit = limit === 0 ? null : limit;
-
-    const embed = new EmbedBuilder()
-      .setColor("#0099ff")
-      .setTitle("👥 User Limit Updated")
-      .setDescription(
-        `User limit set to: **${limit === 0 ? "No limit" : limit}**`
-      )
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async renameDungeon(channel, args, voiceChannel, dungeonData) {
-    const newName = args.join(" ");
-
-    if (!newName) {
-      return this.sendErrorMessage(
-        channel,
-        "Please provide a new name for the dungeon."
-      );
-    }
-
-    if (newName.length > 100) {
-      return this.sendErrorMessage(
-        channel,
-        "Dungeon name must be 100 characters or less."
-      );
-    }
-
-    await voiceChannel.setName(newName);
-
-    const embed = new EmbedBuilder()
-      .setColor("#0099ff")
-      .setTitle("✏️ Dungeon Renamed")
-      .setDescription(`Dungeon renamed to: **${newName}**`)
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  async endDungeon(channel, voiceChannel) {
-    const embed = new EmbedBuilder()
-      .setColor("#ff0000")
-      .setTitle("🏁 Dungeon Ended")
-      .setDescription("This dungeon has been manually ended by the owner.")
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-
-    setTimeout(() => {
-      this.deleteDungeon(voiceChannel.id);
-    }, 3000); // 3 second delay to show message
-  }
-
-  async sendErrorMessage(channel, message) {
-    const embed = new EmbedBuilder()
-      .setColor("#ff0000")
-      .setTitle("❌ Error")
-      .setDescription(message)
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-  }
-
-  start() {
-    const token = process.env.DISCORD_BOT_TOKEN;
-
-    if (!token) {
-      console.error(
-        "❌ ERROR: DISCORD_BOT_TOKEN not found in environment variables!"
-      );
-      console.error(
-        "📝 Please check your .env file and make sure it contains:"
-      );
-      console.error("   DISCORD_BOT_TOKEN=your_actual_bot_token_here");
-      process.exit(1);
-    }
-
-    if (token === "your_bot_token_here") {
-      console.error(
-        '❌ ERROR: Please replace "your_bot_token_here" with your actual Discord bot token!'
-      );
-      console.error(
-        "📝 Get your token from: https://discord.com/developers/applications"
-      );
-      process.exit(1);
-    }
-
-    console.log("🔑 Attempting to login with bot token...");
-    this.client.login(token).catch((error) => {
-      console.error("❌ Failed to login to Discord:", error.message);
-      console.error("📝 Please verify your bot token is correct and valid.");
-      process.exit(1);
-    });
-  }
 }
 
 // Create and start the bot
